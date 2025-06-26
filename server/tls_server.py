@@ -6,6 +6,8 @@ import sys
 import os
 from threading import Thread, Lock
 from datetime import datetime
+import requests
+from web_interface import add_message
 
 # ANSI color codes
 GREEN = '\033[0;32m'
@@ -15,7 +17,7 @@ RED = '\033[0;31m'
 RESET = '\033[0m'
 
 class TLSServer:
-    def __init__(self, host='localhost', port=8443):
+    def __init__(self, host='0.0.0.0', port=8443):
         self.host = host
         self.port = port
         self.cert_path = os.path.join("..", "certs", "server.crt")
@@ -26,7 +28,7 @@ class TLSServer:
 
     def check_certificates(self):
         if not os.path.exists(self.cert_path) or not os.path.exists(self.key_path):
-            print("Error: Certificate files not found.")
+            print(f"{RED}Error: Certificate or key file not found.{RESET}")
             print(f"Expected: {self.cert_path} and {self.key_path}")
             print("Run cert_generator.sh first to create the certificates.")
             return False
@@ -35,8 +37,8 @@ class TLSServer:
     def handle_client(self, client_socket, address):
         try:
             print(f"\n{GREEN}[+] New client connected: {address[0]}:{address[1]}{RESET}")
-            client_socket.settimeout(300)  # 5 minutes timeout
-            
+            client_socket.settimeout(300)
+
             while self.running:
                 try:
                     data = client_socket.recv(1024)
@@ -44,11 +46,22 @@ class TLSServer:
                         break
                     decoded_message = data.decode().strip()
                     if decoded_message:
-                        # Format the message with timestamp
                         timestamp = datetime.now().strftime("%H:%M:%S")
                         message = f"\n[{timestamp}] {BLUE}Client {address[0]}:{address[1]}:{RESET} {decoded_message}"
                         print(message)
-                        self.broadcast(message, client_socket)
+                        self.broadcast(message, sender_socket=client_socket)
+                        
+                        # Send message to web interface via HTTP POST
+                        client_address = f"{address[0]}:{address[1]}"
+                        try:
+                            requests.post(
+                                "http://localhost:5000/api/add-message",
+                                json={"client_address": client_address, "message": decoded_message},
+                                timeout=1
+                            )
+                        except Exception as e:
+                            print(f"{YELLOW}Could not update web interface: {e}{RESET}")
+                        
                 except socket.timeout:
                     try:
                         client_socket.send(b"ping")
@@ -57,7 +70,7 @@ class TLSServer:
                         print(f"{YELLOW}[-] Client {address[0]}:{address[1]} timed out{RESET}")
                         break
                 except (ssl.SSLError, socket.error) as e:
-                    print(f"\n{RED}[-] Error with {address}: {e}{RESET}")
+                    print(f"{RED}[-] Error with client {address}: {e}{RESET}")
                     break
         finally:
             with self.clients_lock:
@@ -67,7 +80,17 @@ class TLSServer:
                 client_socket.close()
             except:
                 pass
-            print(f"\n{YELLOW}[-] Client disconnected: {address[0]}:{address[1]}{RESET}")
+            # Notify web interface about disconnection
+            client_address = f"{address[0]}:{address[1]}"
+            try:
+                requests.post(
+                    "http://localhost:5000/api/disconnect-client",
+                    json={"client_address": client_address},
+                    timeout=1
+                )
+            except Exception as e:
+                print(f"{YELLOW}Could not notify web interface of disconnect: {e}{RESET}")
+            print(f"{YELLOW}[-] Client disconnected: {address[0]}:{address[1]}{RESET}")
 
     def broadcast(self, message, sender_socket=None):
         with self.clients_lock:
@@ -84,16 +107,16 @@ class TLSServer:
 
         try:
             context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-            context.load_cert_chain(self.cert_path, self.key_path)
+            context.load_cert_chain(certfile=self.cert_path, keyfile=self.key_path)
+            context.verify_mode = ssl.CERT_NONE  # Disable client certificate verification for simplicity
 
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
                 server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                # Set server socket timeout
-                server_socket.settimeout(60)  # 60 seconds timeout
+                server_socket.settimeout(60)
                 server_socket.bind((self.host, self.port))
                 server_socket.listen(5)
-                
-                print(f"TLS Server running on {self.host}:{self.port}")
+
+                print(f"{GREEN}TLS Server running on {self.host}:{self.port}{RESET}")
                 print("Press Ctrl+C to stop the server")
 
                 while self.running:
@@ -101,23 +124,32 @@ class TLSServer:
                     try:
                         client_sock, client_addr = server_socket.accept()
                         secure_client = context.wrap_socket(client_sock, server_side=True)
-                        
+
                         with self.clients_lock:
                             self.clients.append(secure_client)
-                        
-                        print(f"Secure connection established with {client_addr[0]}:{client_addr[1]}")
-                        client_thread = Thread(target=self.handle_client, 
-                                            args=(secure_client, client_addr))
+
+                        print(f"{GREEN}Secure connection established with {client_addr[0]}:{client_addr[1]}{RESET}")
+                        # Notify web interface about new connection
+                        try:
+                            resp = requests.post(
+                                "http://localhost:5000/api/add-connection",
+                                json={"timestamp": datetime.now().isoformat(), "client_address": f"{client_addr[0]}:{client_addr[1]}"},
+                                timeout=1
+                            )
+                            print(f"DEBUG: POST /api/add-connection status: {resp.status_code}, response: {resp.text}")
+                        except Exception as e:
+                            print(f"{YELLOW}Could not update connection stats: {e}{RESET}")
+                        client_thread = Thread(target=self.handle_client, args=(secure_client, client_addr))
                         client_thread.daemon = True
                         client_thread.start()
-                    except (ssl.SSLError, socket.error) as e:
-                        print(f"Connection error: {e}")
+                    except (ssl.SSLError, socket.timeout, socket.error) as e:
+                        print(f"{RED}Connection error: {e}{RESET}")
                         continue
 
         except KeyboardInterrupt:
-            print("\nServer shutting down...")
+            print(f"\n{YELLOW}Server shutting down...{RESET}")
         except Exception as e:
-            print(f"Server error: {e}")
+            print(f"{RED}Server error: {e}{RESET}")
         finally:
             self.running = False
             with self.clients_lock:
@@ -126,8 +158,13 @@ class TLSServer:
                         client.close()
                     except:
                         pass
-            print("Server shut down")
+            print(f"{GREEN}Server shut down{RESET}")
 
 if __name__ == "__main__":
-    server = TLSServer()
+    if len(sys.argv) > 1:
+        ip = sys.argv[1]
+    else:
+        ip = input("Enter IP to bind server on (e.g., 0.0.0.0 or 172.17.8.200): ").strip()
+
+    server = TLSServer(host=ip)
     server.run()
